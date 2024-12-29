@@ -1,209 +1,219 @@
 import 'dart:async';
+import 'dart:ui';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-class QueueProfile {
-  final String queueId;
-  final bool groupingEn;
-  final String landmark;
-  final String location;
-  final String name;
+import '../utilities/notification.dart';
+import '../widgets/main/queue_card_widget.dart';
+
+class Queue {
+  // Firebase's Queue Information
+  String queueId;
+  String landmark;
+  String location;
+  String name;
+
   int waitTime;
-  bool isTimerActive;
-  Function? timerHandler;
-  Function? queueRebuilder;
+  int indexWaitTime;
+  bool isTimerActive = false;
 
-  QueueProfile(this.queueId, this.groupingEn, this.landmark, this.location,
-      this.name, this.waitTime)
-      : isTimerActive = false,
-        timerHandler = null,
-        queueRebuilder = null;
+  // Queue Card Metadata
+  Color queueCardColor = Color.fromARGB(255, 30, 144, 255);
 
-  void initializer(timerManager, queueRebuilderArg) {
-    timerHandler = timerManager;
-    queueRebuilder = queueRebuilderArg;
+  int userQueuePosition = 0;
+  List queueMembers = [];
+  int seconds = 59;
+
+  Function queueStateManager = () {};
+
+  Queue({
+    required this.queueId,
+    required this.landmark,
+    required this.location,
+    required this.name,
+    required this.waitTime,
+  }) : indexWaitTime = waitTime;
+
+  void queueCardWidgetBridge(Function queueCardWidgetState) {
+    queueStateManager = queueCardWidgetState;
   }
 
-  void startTimer() {
-    int seconds = 59; // Start the countdown at 59 seconds
-    isTimerActive = true;
-
-    Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (seconds > 0) {
-        seconds--; // Decrement the seconds
-        timerHandler!(seconds, waitTime);
-      } else {
-        // When seconds reach 0
-        timer.cancel(); // Stop the current timer
+  void startQueueTimer() {
+    seconds = 59;
+    var timer = Timer.periodic(Duration(seconds: 1), (timer) {
+      seconds--;
+      queueStateManager("update-index");
+      if (seconds == 0) {
+        timer.cancel();
         if (waitTime > 0) {
-          waitTime--; // Decrement the waitTime (minutes)
-          startTimer(); // Restart the timer with reset seconds
+          waitTime--;
+          startQueueTimer();
         } else {
-          // When both waitTime and seconds are 0, execute removeUser
-          removeUser();
-          print('End of timer reached');
+          timer.cancel();
+          queueUserRemoval();
         }
       }
     });
   }
 
-  Future<void> getUserQueuePosition(queuePositionManager) async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    var userId = prefs.getString('userId');
-    List activeMembers = [];
-    int index = 0;
-    int queueMembersCount = 0;
+  void startQueueTimerAsync(newSeconds) {
+    seconds = newSeconds;
+    Timer.periodic(Duration(seconds: 1), (timer) {
+      seconds--;
+      queueStateManager("update-index");
+      if (seconds == 0) {
+        timer.cancel();
+        if (waitTime > 0) {
+          waitTime--;
+          startQueueTimer();
+        } else {
+          timer.cancel();
+          queueUserRemoval();
+        }
+      }
+    });
+  }
 
-    QuerySnapshot querySnapshot = await FirebaseFirestore.instance
-        .collection(queueId)
-        .where(FieldPath.documentId, isNotEqualTo: "qInfo")
-        .get();
+  Future<void> queueUserRemoval() async {
+    // Finds the User ID from Local Storage
+    final SharedPreferences pref = await SharedPreferences.getInstance();
+    var userId = pref.getString("userId");
 
-    // Loop through the documents and print them
-    for (var doc in querySnapshot.docs) {
-      var data = doc.data() as Map<String, dynamic>;
-      activeMembers.add({
-        'timestamp': data['timestamp'].toDate(), // Keep as DateTime object
-        'data': data,
-      });
+    var collectionQuery = FirebaseFirestore.instance.collection(queueId);
 
-      queueMembersCount++;
+    final collectionSnapshot =
+        await collectionQuery
+            .where("id", isEqualTo: userId?.toUpperCase())
+            .get();
+
+    for (var doc in collectionSnapshot.docs) {
+      await doc.reference.delete();
     }
-    activeMembers.sort((a, b) =>
-        a['timestamp'].compareTo(b['timestamp'])); // Sort from oldest to newest
 
-    index =
-        activeMembers.indexWhere((element) => element['data']['id'] == userId);
+    queueStateManager("reload-tree");
 
-    print(activeMembers);
+    await FirebaseFirestore.instance.collection("users").doc(userId).update({
+      'queues': FieldValue.arrayRemove([queueId]),
+    });
+  }
 
-    if (index == 0) {
-      index = 1;
-      // print("Index updated to ${index}");
-      startTimer();
+  Future<void> queueIndexManager() async {
+    // Finds the logged in user's index
+    final SharedPreferences pref = await SharedPreferences.getInstance();
+    var userId = pref.getString("userId");
+
+    userQueuePosition = queueMembers.indexWhere(
+      (element) => element['data']['id'] == userId,
+    );
+
+    // Updates index according to one and not Zero
+    if (userQueuePosition == 0) {
+      userQueuePosition = 1;
+      queueCardColor = Color.fromARGB(255, 255, 165, 0);
+      isTimerActive = true;
+      showNotification(1);
+      startQueueTimer();
     } else {
-      index += 1;
-      // print("No Else ${index}");
+      userQueuePosition++;
     }
 
-    queuePositionManager(index, queueMembersCount);
+    switch (userQueuePosition) {
+      case 2:
+        showNotification(2);
+        break;
+      case 3:
+        showNotification(3);
+    }
 
+    // Alerts the Queue Widget of a new state change
+    queueStateManager("update-index");
+  }
+
+  Future<void> findUserIndex() async {
+    QuerySnapshot snapshot =
+        await FirebaseFirestore.instance
+            .collection(queueId)
+            .where(FieldPath.documentId, isNotEqualTo: "qInfo") // Exclude by ID
+            .get();
+
+    for (var doc in snapshot.docs) {
+      Map<String, dynamic> docMember = doc.data() as Map<String, dynamic>;
+
+      Map<String, dynamic> queueMember = {
+        'timestamp': docMember['timestamp'].toDate(),
+        "data": docMember,
+      };
+
+      // Adds the newly joined queue member to the Array of Queue Members
+      queueMembers.add(queueMember);
+
+      // Resorts the Queue Members Array from first joined to last joined
+      queueMembers.sort(
+        (a, b) => a['timestamp'].compareTo(b['timestamp']),
+      ); // Sort from oldest to newest
+    }
+
+    print(queueMembers);
+
+    queueIndexManager();
+    updateUserIndexRealTime();
+  }
+
+  void updateUserIndexRealTime() {
     FirebaseFirestore.instance
         .collection(queueId)
-        .snapshots(
-            includeMetadataChanges: true) // Optional: includes metadata changes
+        .snapshots(includeMetadataChanges: true)
         .listen((snapshot) {
-      // Ignore the initial snapshot (if it exists)
-      if (snapshot.metadata.isFromCache) {
-        return;
-      }
-
-      for (var change in snapshot.docChanges) {
-        if (change.doc.id == 'qInfo') {
-          continue;
-        }
-
-        if (change.type == DocumentChangeType.added) {
-          activeMembers.add({
-            'timestamp': (change.doc.data()?['timestamp'] as Timestamp)
-                .toDate()
-                .toIso8601String(),
-            'data': change.doc.data(),
-          });
-          activeMembers
-              .sort((a, b) => a['timestamp'].compareTo(b['timestamp']));
-
-          index = activeMembers
-              .indexWhere((element) => element['data']['id'] == userId);
-
-          queueMembersCount++;
-
-          if (index == 0) {
-            index = 1;
-            print("Index updated to ${index}");
-            startTimer();
-          } else {
-            index += 1;
-            print("No Else ${index}");
+          // Ignore cache data
+          if (snapshot.metadata.isFromCache) {
+            return;
           }
-          queuePositionManager(index, queueMembersCount);
-        }
-        if (change.type == DocumentChangeType.removed) {
-          var data = change.doc.data() as Map<String, dynamic>;
 
-          // Find the index of the user to remove
-          int deletedUserIndex = activeMembers
-              .indexWhere((element) => element['data']['id'] == data['id']);
-
-          if (deletedUserIndex != -1) {
-            // Remove the user from the list
-            activeMembers.removeAt(deletedUserIndex);
-
-            // Decrement the member count
-            queueMembersCount--;
-
-            // Re-sort the active members by timestamp (oldest to newest)
-            activeMembers
-                .sort((a, b) => a['timestamp'].compareTo(b['timestamp']));
-
-            // Find the new index of the current user
-            index = activeMembers
-                .indexWhere((element) => element['data']['id'] == userId);
-
-            // Adjust index if needed
-            if (index == 0) {
-              index = 1; // If the current user is at the start, set index to 1
-              print("Index updated to ${index}");
-              startTimer(); // Restart the timer if the user is now at the top
-            } else {
-              index += 1; // Adjust index accordingly
-              print("No Else ${index}");
+          // Loop through the document changes
+          for (var change in snapshot.docChanges) {
+            // Skip the 'qInfo' document (presumably metadata or queue info)
+            if (change.doc.id == 'qInfo') {
+              continue;
             }
-            queuePositionManager(index, queueMembersCount); // Update position
+
+            if (change.type == DocumentChangeType.added) {
+              print("New Member!");
+              // Create a Profile for the Queue Member
+              Map<String, dynamic> queueMember = {
+                'timestamp': change.doc.data()?['timestamp'].toDate(),
+                "data": change.doc.data(),
+              };
+
+              // Adds the newly joined queue member to the Array of Queue Members
+              queueMembers.add(queueMember);
+
+              // Resorts the Queue Members Array from first joined to last joined
+              queueMembers.sort(
+                (a, b) => a['timestamp'].compareTo(b['timestamp']),
+              ); // Sort from oldest to newest
+
+              queueIndexManager();
+            }
+            if (change.type == DocumentChangeType.removed) {
+              print("New Member!");
+              // Create a Profile for the Queue Member
+
+              queueMembers.removeWhere(
+                (queueMember) =>
+                    queueMember["data"]["id"] == change.doc.data()?["id"],
+              );
+
+              // Resorts the Queue Members Array from first joined to last joined
+              queueMembers.sort(
+                (a, b) => a['timestamp'].compareTo(b['timestamp']),
+              ); // Sort from oldest to newest
+
+              print(queueMembers);
+
+              queueIndexManager();
+            }
           }
-        }
-      }
-    }, onError: (error) {
-      print('Error in snapshot stream: $error');
-    });
-  }
-
-  Future<void> removeUser() async {
-    try {
-      // Get SharedPreferences instance
-      final SharedPreferences pref = await SharedPreferences.getInstance();
-      var userId = pref.getString("userId");
-
-      // Ensure userId and queueId are not null
-      if (userId == null || queueId.isEmpty) {
-        print("UserId or QueueId is null or empty");
-        return;
-      }
-
-      final collectionRef = FirebaseFirestore.instance.collection('users');
-      await collectionRef.doc(userId.toUpperCase()).update({
-        'queues': FieldValue.arrayRemove([queueId]),
-      });
-
-      // Reference to the queue collection
-      final collectionRefQueue = FirebaseFirestore.instance.collection(queueId);
-
-      // Query to find documents that meet the condition
-      final querySnapshot = await collectionRefQueue
-          .where("id", isEqualTo: userId.toUpperCase())
-          .get();
-
-      // Delete each document that matches the condition
-      for (var doc in querySnapshot.docs) {
-        await doc.reference.delete();
-      }
-
-      queueRebuilder!();
-      print("Queue removed successfully.");
-    } catch (e) {
-      print("Error removing queue: $e");
-    }
+        });
   }
 }
